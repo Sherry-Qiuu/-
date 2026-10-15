@@ -56,7 +56,9 @@ const emitAck = (s, event, ...args) => new Promise(res => s.emit(event, ...args,
   console.log('== 3. Socket Origin / 身份校验 ==');
   let err = null;
   try { await connect(null); } catch (e) { err = e.message; }
-  ok('缺少 Origin 被拒', !!err, err);
+  let connectedNoOrigin = false;
+  try { const s = await connect(c1, null); connectedNoOrigin = s.connected; s.close(); } catch { /* 保持 false */ }
+  ok('缺失 Origin 的合法 cookie 放行（剥头代理兼容）', connectedNoOrigin);
   err = null;
   try { await connect(c1, 'http://evil.example.com'); } catch (e) { err = e.message; }
   ok('异源 Origin 被拒', !!err, err);

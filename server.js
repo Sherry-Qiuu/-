@@ -289,16 +289,19 @@ const PUBLIC_ORIGIN_HOST = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLI
 io.use((socket, next) => {
   const h = socket.handshake.headers;
   const origin = h.origin;
-  if (!origin) return next(new Error('缺少 Origin，拒绝连接。'));
-  let originHost;
-  try { originHost = new URL(origin).host; } catch { return next(new Error('Origin 无效。')); }
-  const forwardedHosts = new Set();
-  for (const key of ['host', 'x-forwarded-host']) {
-    const v = h[key];
-    if (typeof v === 'string') v.split(',').map(s => s.trim()).forEach(x => { if (x) forwardedHosts.add(x); });
+  // Origin 缺失时放行：部分代理/内嵌客户端会剥掉该头；跨站伪造连不上签名
+  // Cookie（HttpOnly + SameSite=Lax），身份校验仍会拒绝它们。存在则必须匹配。
+  if (origin) {
+    let originHost;
+    try { originHost = new URL(origin).host; } catch { return next(new Error('Origin 无效。')); }
+    const forwardedHosts = new Set();
+    for (const key of ['host', 'x-forwarded-host']) {
+      const v = h[key];
+      if (typeof v === 'string') v.split(',').map(s => s.trim()).forEach(x => { if (x) forwardedHosts.add(x); });
+    }
+    const originOK = forwardedHosts.has(originHost) || (!!PUBLIC_ORIGIN_HOST && originHost === PUBLIC_ORIGIN_HOST);
+    if (!originOK) return next(new Error('Origin 不被允许。'));
   }
-  const originOK = forwardedHosts.has(originHost) || (!!PUBLIC_ORIGIN_HOST && originHost === PUBLIC_ORIGIN_HOST);
-  if (!originOK) return next(new Error('Origin 不被允许。'));
   const pid = verifySignedPlayerId(parseCookies(h.cookie)[IDENTITY_COOKIE]);
   if (!pid) return next(new Error('身份无效，请刷新页面重试。'));
   socket.data.playerId = pid;
