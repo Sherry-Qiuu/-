@@ -8,6 +8,12 @@ function fmt(n) { n = Math.max(0, Number(n) || 0); return `${String(Math.floor(n
 // 玩家身份由服务器通过 HttpOnly 签名 Cookie 管理，浏览器端不再保存或上报 playerId
 socket.on('connect', () => { $('connection').textContent = '已连接'; loadSaves(); loadLeaderboard(); });
 socket.on('disconnect', () => { $('connection').textContent = '连接断开'; toast('连接断开。服务器会尝试自动保存当前游戏。'); });
+socket.on('reconnect_attempt', n => { $('connection').textContent = `重连中…(第 ${n} 次)`; });
+socket.on('connect_error', e => {
+  const reason = e && e.message ? e.message : '网络错误';
+  $('connection').textContent = '连接失败：' + reason;
+  console.error('[连接诊断] transport=', socket.io.engine.transport.name, 'error=', reason);
+});
 socket.on('game-state', s => { state = s; timerBase = s.elapsedSeconds || 0; timerStartedAt = s.status === 'playing' && !s.paused ? Date.now() : null; render(s); });
 socket.on('game-finished', r => { timerBase = r.seconds; timerStartedAt = null; $('timer').textContent = fmt(r.seconds); toast(r.outcome === 'won' ? `通关成功！用时 ${fmt(r.seconds)}，最佳成绩已更新。` : '本局失败，可以重新开始。'); loadLeaderboard(); });
 setInterval(() => { if (state) $('timer').textContent = fmt(timerBase + (timerStartedAt ? Math.floor((Date.now()-timerStartedAt)/1000) : 0)); }, 250);
