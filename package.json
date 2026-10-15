@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "scripts": {
-    "start": "node server.js",
+    "start": "PUBLIC_ORIGIN=https://minesweeper-arena-34333.app.workbuddy.host node server.js",
     "dev": "node server.js"
   },
   "dependencies": {

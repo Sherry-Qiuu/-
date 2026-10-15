@@ -282,19 +282,23 @@ app.get('/api/saves', (req, res) => {
 });
 
 // ---------- Socket 连接：Origin 校验 + 身份校验 ----------
+// 托管平台的反向代理会把 Host / X-Forwarded-Host 全部改写成沙箱内部地址，
+// 公开域名到不了应用层，因此支持用 PUBLIC_ORIGIN 显式声明公开域名；
+// 未声明时回退为与 Host / X-Forwarded-Host 比对（本地直连场景）。
+const PUBLIC_ORIGIN_HOST = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLIC_ORIGIN).host : '';
 io.use((socket, next) => {
   const h = socket.handshake.headers;
   const origin = h.origin;
   if (!origin) return next(new Error('缺少 Origin，拒绝连接。'));
   let originHost;
   try { originHost = new URL(origin).host; } catch { return next(new Error('Origin 无效。')); }
-  // 反向代理会把 Host 改写成内部地址，公开域名在 X-Forwarded-Host 里，两者都放行
-  const allowed = new Set();
+  const forwardedHosts = new Set();
   for (const key of ['host', 'x-forwarded-host']) {
     const v = h[key];
-    if (typeof v === 'string') v.split(',').map(s => s.trim()).forEach(x => { if (x) allowed.add(x); });
+    if (typeof v === 'string') v.split(',').map(s => s.trim()).forEach(x => { if (x) forwardedHosts.add(x); });
   }
-  if (!allowed.has(originHost)) return next(new Error('Origin 不被允许。'));
+  const originOK = forwardedHosts.has(originHost) || (!!PUBLIC_ORIGIN_HOST && originHost === PUBLIC_ORIGIN_HOST);
+  if (!originOK) return next(new Error('Origin 不被允许。'));
   const pid = verifySignedPlayerId(parseCookies(h.cookie)[IDENTITY_COOKIE]);
   if (!pid) return next(new Error('身份无效，请刷新页面重试。'));
   socket.data.playerId = pid;
