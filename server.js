@@ -283,13 +283,19 @@ app.get('/api/saves', (req, res) => {
 
 // ---------- Socket 连接：Origin 校验 + 身份校验 ----------
 io.use((socket, next) => {
-  const origin = socket.handshake.headers.origin;
-  const host = socket.handshake.headers.host;
+  const h = socket.handshake.headers;
+  const origin = h.origin;
   if (!origin) return next(new Error('缺少 Origin，拒绝连接。'));
-  try {
-    if (new URL(origin).host !== host) return next(new Error('Origin 不被允许。'));
-  } catch { return next(new Error('Origin 无效。')); }
-  const pid = verifySignedPlayerId(parseCookies(socket.handshake.headers.cookie)[IDENTITY_COOKIE]);
+  let originHost;
+  try { originHost = new URL(origin).host; } catch { return next(new Error('Origin 无效。')); }
+  // 反向代理会把 Host 改写成内部地址，公开域名在 X-Forwarded-Host 里，两者都放行
+  const allowed = new Set();
+  for (const key of ['host', 'x-forwarded-host']) {
+    const v = h[key];
+    if (typeof v === 'string') v.split(',').map(s => s.trim()).forEach(x => { if (x) allowed.add(x); });
+  }
+  if (!allowed.has(originHost)) return next(new Error('Origin 不被允许。'));
+  const pid = verifySignedPlayerId(parseCookies(h.cookie)[IDENTITY_COOKIE]);
   if (!pid) return next(new Error('身份无效，请刷新页面重试。'));
   socket.data.playerId = pid;
   next();
