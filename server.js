@@ -23,6 +23,7 @@ const MODES = {
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DB_FILE)) atomicWrite(DB_FILE, { version: 1, bestScores: [], saves: [], history: [] });
+saveDB(readDB()); // 启动即执行一次清洗（trimDB 会剔除 0 秒脏成绩）
 
 // ---------- 身份：HMAC 签名 HttpOnly Cookie ----------
 const IDENTITY_COOKIE = 'msid';
@@ -100,6 +101,8 @@ function readDB() {
 }
 function sizeOf(db) { return Buffer.byteLength(JSON.stringify(db), 'utf8'); }
 function trimDB(db) {
+  // 清理旧版计时 bug 遗留的 0 秒最佳成绩（0 秒永远无法被超越，会永久霸榜）
+  db.bestScores = db.bestScores.filter(s => Number(s.seconds) > 0);
   const now = Date.now();
   db.saves = db.saves.filter(s => now - Date.parse(s.updatedAt || s.createdAt) <= SAVE_TTL);
   db.history.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
@@ -209,7 +212,12 @@ function elapsed(g) {
   if (g.status !== 'playing' || g.paused || !g.startedAt) return g.elapsedSeconds || 0;
   return (g.elapsedSeconds || 0) + Math.floor((Date.now() - g.startedAt) / 1000);
 }
-function stopClock(g) { g.elapsedSeconds = elapsed(g); g.startedAt = null; }
+// 停表不依赖对局状态：必须在实际改状态之前/之后都能正确累计已进行时间
+// （旧实现先改 status 再 stopClock，elapsed() 见状态非 playing 直接返回 0，导致终局用时恒为 00:00）
+function stopClock(g) {
+  if (g.startedAt) g.elapsedSeconds = (g.elapsedSeconds || 0) + Math.floor((Date.now() - g.startedAt) / 1000);
+  g.startedAt = null;
+}
 function startClock(g) { if (!g.startedAt && !g.paused && g.status === 'playing') g.startedAt = Date.now(); }
 function publicState(g) {
   return { difficulty: g.difficulty, rows: g.rows, cols: g.cols, mines: g.mines, status: g.status,
