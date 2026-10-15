@@ -1,24 +1,19 @@
 const socket = io();
 const $ = id => document.getElementById(id);
 const MODE_NAMES = { easy: '简单', medium: '中等', hard: '困难' };
-let playerId = localStorage.getItem('minesweeperPlayerId') || '';
 let gameId = null, state = null, toastTimer = null, timerBase = 0, timerStartedAt = null;
 function toast(msg) { $('toast').textContent = msg; $('toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.remove('show'), 2800); }
 function playerName() { return $('playerName').value.trim() || 'Player'; }
 function fmt(n) { n = Math.max(0, Number(n) || 0); return `${String(Math.floor(n/60)).padStart(2,'0')}:${String(n%60).padStart(2,'0')}`; }
-function ensurePlayer() {
-  socket.emit('new-player-id', playerId, result => {
-    playerId = result.playerId; localStorage.setItem('minesweeperPlayerId', playerId); loadSaves(); loadLeaderboard();
-  });
-}
-socket.on('connect', () => { $('connection').textContent = '已连接'; ensurePlayer(); });
+// 玩家身份由服务器通过 HttpOnly 签名 Cookie 管理，浏览器端不再保存或上报 playerId
+socket.on('connect', () => { $('connection').textContent = '已连接'; loadSaves(); loadLeaderboard(); });
 socket.on('disconnect', () => { $('connection').textContent = '连接断开'; toast('连接断开。服务器会尝试自动保存当前游戏。'); });
 socket.on('game-state', s => { state = s; timerBase = s.elapsedSeconds || 0; timerStartedAt = s.status === 'playing' && !s.paused ? Date.now() : null; render(s); });
 socket.on('game-finished', r => { timerBase = r.seconds; timerStartedAt = null; $('timer').textContent = fmt(r.seconds); toast(r.outcome === 'won' ? `通关成功！用时 ${fmt(r.seconds)}，最佳成绩已更新。` : '本局失败，可以重新开始。'); loadLeaderboard(); });
 setInterval(() => { if (state) $('timer').textContent = fmt(timerBase + (timerStartedAt ? Math.floor((Date.now()-timerStartedAt)/1000) : 0)); }, 250);
 function startGame() {
   $('startBtn').disabled = true;
-  socket.emit('create-game', { playerId, name: playerName(), difficulty: $('difficulty').value }, result => {
+  socket.emit('create-game', { name: playerName(), difficulty: $('difficulty').value }, result => {
     $('startBtn').disabled = false; if (result.error) return toast(result.error); enterGame(result);
   });
 }
@@ -43,8 +38,7 @@ function render(s) {
   });
 }
 function loadSaves() {
-  if (!playerId) return;
-  fetch('/api/saves?playerId=' + encodeURIComponent(playerId)).then(r => r.json()).then(saves => {
+  fetch('/api/saves').then(r => r.json()).then(saves => {
     const root = $('saves'); root.replaceChildren();
     if (!saves.length) { root.className = 'empty'; root.textContent = '暂无存档。游戏中选择“保存并退出”后，存档会显示在这里。'; return; }
     root.className = '';
@@ -52,7 +46,7 @@ function loadSaves() {
       const row = document.createElement('div'); row.className = 'save-row'; const info = document.createElement('div'); info.className = 'save-info';
       const title = document.createElement('strong'); title.textContent = `${MODE_NAMES[s.difficulty]} · ${fmt(s.elapsedSeconds)}`;
       const meta = document.createElement('small'); meta.textContent = `保存于 ${new Date(s.updatedAt).toLocaleString()}`; info.append(title, meta);
-      const btn = document.createElement('button'); btn.className = 'small'; btn.textContent = '恢复'; btn.addEventListener('click', () => socket.emit('resume-save', { playerId, saveId: s.saveId, name: playerName() }, result => { if (result.error) return toast(result.error); enterGame(result); }));
+      const btn = document.createElement('button'); btn.className = 'small'; btn.textContent = '恢复'; btn.addEventListener('click', () => socket.emit('resume-save', { saveId: s.saveId, name: playerName() }, result => { if (result.error) return toast(result.error); enterGame(result); }));
       row.append(info, btn); root.appendChild(row);
     });
   }).catch(() => { $('saves').textContent = '无法读取存档。'; });

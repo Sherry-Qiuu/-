@@ -8,8 +8,9 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 1e6 });
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'database.json');
 const MAX_BYTES = 500 * 1024 * 1024;
 const SAVE_TTL = 30 * 24 * 60 * 60 * 1000;
@@ -22,6 +23,72 @@ const MODES = {
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DB_FILE)) atomicWrite(DB_FILE, { version: 1, bestScores: [], saves: [], history: [] });
+
+// ---------- 身份：HMAC 签名 HttpOnly Cookie ----------
+const IDENTITY_COOKIE = 'msid';
+const COOKIE_MAX_AGE_MS = 365 * 24 * 60 * 60 * 1000;
+let IDENTITY_SECRET = process.env.IDENTITY_SECRET || '';
+if (!IDENTITY_SECRET) {
+  const secretFile = path.join(DATA_DIR, '.identity-secret');
+  try { IDENTITY_SECRET = fs.readFileSync(secretFile, 'utf8').trim(); } catch { /* 首次启动生成 */ }
+  if (!/^[A-Za-z0-9_-]{32,}$/.test(IDENTITY_SECRET)) {
+    IDENTITY_SECRET = crypto.randomBytes(32).toString('base64url');
+    fs.writeFileSync(secretFile, IDENTITY_SECRET, { mode: 0o600 });
+  }
+}
+function signPlayerId(pid) {
+  return pid + '.' + crypto.createHmac('sha256', IDENTITY_SECRET).update(pid).digest('base64url');
+}
+function verifySignedPlayerId(v) {
+  if (typeof v !== 'string') return null;
+  const dot = v.lastIndexOf('.');
+  if (dot <= 0) return null;
+  const pid = v.slice(0, dot);
+  if (!validPlayerId(pid)) return null;
+  const expected = crypto.createHmac('sha256', IDENTITY_SECRET).update(pid).digest();
+  let got;
+  try { got = Buffer.from(v.slice(dot + 1), 'base64url'); } catch { return null; }
+  if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;
+  return pid;
+}
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); } catch { /* 跳过畸形段 */ }
+  }
+  return out;
+}
+// 任何 HTTP 请求进来：有效签名 cookie → 采用其中身份；否则签发新身份并种 cookie（刷新缓存也不会丢身份）
+app.use((req, res, next) => {
+  const pid = verifySignedPlayerId(parseCookies(req.headers.cookie)[IDENTITY_COOKIE]);
+  if (pid) { req.playerId = pid; return next(); }
+  const fresh = id(16);
+  res.cookie(IDENTITY_COOKIE, signPlayerId(fresh), {
+    httpOnly: true, sameSite: 'lax', path: '/', maxAge: COOKIE_MAX_AGE_MS, secure: req.secure
+  });
+  req.playerId = fresh;
+  next();
+});
+
+// ---------- HTTP 速率限制 ----------
+function httpRateLimit({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, h] of hits) if (now - h.start >= windowMs) hits.delete(k);
+  }, windowMs).unref();
+  return (req, res, next) => {
+    const now = Date.now(), k = req.ip || 'unknown';
+    let h = hits.get(k);
+    if (!h || now - h.start >= windowMs) { h = { start: now, count: 0 }; hits.set(k, h); }
+    if (++h.count > max) return res.status(429).json({ error: '请求过于频繁，请稍后再试。' });
+    next();
+  };
+}
+app.use('/api', httpRateLimit({ windowMs: 60_000, max: 60 }));
 function atomicWrite(file, value) {
   const tmp = file + '.' + process.pid + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 });
@@ -208,17 +275,45 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/leaderboard', (req, res) => res.json(leaderboard(MODES[req.query.difficulty] ? req.query.difficulty : null)));
 app.get('/api/saves', (req, res) => {
-  const pid = validPlayerId(req.query.playerId); if (!pid) return res.json([]);
+  const pid = req.playerId;
   res.json(readDB().saves.filter(s => s.playerId === pid).map(s => ({ saveId: s.saveId, difficulty: s.difficulty,
     elapsedSeconds: s.elapsedSeconds, createdAt: s.createdAt, updatedAt: s.updatedAt }))
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)));
 });
 
+// ---------- Socket 连接：Origin 校验 + 身份校验 ----------
+io.use((socket, next) => {
+  const origin = socket.handshake.headers.origin;
+  const host = socket.handshake.headers.host;
+  if (!origin) return next(new Error('缺少 Origin，拒绝连接。'));
+  try {
+    if (new URL(origin).host !== host) return next(new Error('Origin 不被允许。'));
+  } catch { return next(new Error('Origin 无效。')); }
+  const pid = verifySignedPlayerId(parseCookies(socket.handshake.headers.cookie)[IDENTITY_COOKIE]);
+  if (!pid) return next(new Error('身份无效，请刷新页面重试。'));
+  socket.data.playerId = pid;
+  next();
+});
+
+// 事件级速率限制 + 统一防崩溃（畸形参数/回调不会击穿进程）
+function limitEvent(socket, event, { windowMs, max }, handler) {
+  socket.on(event, (...args) => {
+    const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+    const store = socket.data.rateLimit || (socket.data.rateLimit = new Map());
+    const now = Date.now();
+    let h = store.get(event);
+    if (!h || now - h.start >= windowMs) { h = { start: now, count: 0 }; store.set(event, h); }
+    if (++h.count > max) { if (cb) cb({ error: '操作过于频繁，请稍后再试。' }); return; }
+    try { handler(...args); }
+    catch (e) { console.error(`处理 ${event} 事件时出错:`, e); if (cb) cb({ error: '服务器内部错误。' }); }
+  });
+}
+
 io.on('connection', socket => {
-  socket.on('new-player-id', (candidate, cb = () => {}) => cb({ playerId: validPlayerId(candidate) || id(16) }));
-  socket.on('create-game', ({ playerId, name, difficulty } = {}, cb = () => {}) => {
+  const pid = socket.data.playerId;
+  limitEvent(socket, 'create-game', { windowMs: 60_000, max: 10 }, ({ name, difficulty } = {}, cb = () => {}) => {
+    if (typeof cb !== 'function') cb = () => {};
     try {
-      const pid = validPlayerId(playerId); if (!pid) return cb({ error: '玩家 ID 无效，请刷新页面。' });
       if (!MODES[difficulty]) return cb({ error: '请选择有效难度。' });
       const gameId = id(6).toUpperCase();
       const g = { ...generateBoard(difficulty), gameId, playerId: pid, playerName: safeName(name), difficulty,
@@ -227,7 +322,7 @@ io.on('connection', socket => {
       cb({ gameId, state: publicState(g) });
     } catch (e) { cb({ error: e.message || '创建游戏失败。' }); }
   });
-  socket.on('reveal', ({ index } = {}) => {
+  limitEvent(socket, 'reveal', { windowMs: 10_000, max: 120 }, ({ index } = {}) => {
     const g = games.get(socket.data.gameId); if (!g || g.socketId !== socket.id) return;
     reveal(g, index);
     if (g.status === 'won' && !g.scoreSaved) {
@@ -240,30 +335,31 @@ io.on('connection', socket => {
     }
     io.to(g.gameId).emit('game-state', publicState(g));
   });
-  socket.on('toggle-flag', ({ index } = {}) => {
+  limitEvent(socket, 'toggle-flag', { windowMs: 10_000, max: 60 }, ({ index } = {}) => {
     const g = games.get(socket.data.gameId);
     if (!g || g.socketId !== socket.id || g.status !== 'playing' || g.paused || !Number.isInteger(index) || !g.board[index] || g.board[index].revealed) return;
     g.board[index].flagged = !g.board[index].flagged;
     io.to(g.gameId).emit('game-state', publicState(g));
   });
-  socket.on('pause', () => {
+  limitEvent(socket, 'pause', { windowMs: 60_000, max: 30 }, () => {
     const g = games.get(socket.data.gameId); if (!g || g.socketId !== socket.id || g.status !== 'playing') return;
     if (!g.paused) { stopClock(g); g.paused = true; } else { g.paused = false; startClock(g); }
     try { persistGame(g); } catch (e) { console.error('Autosave failed:', e.message); }
     io.to(g.gameId).emit('game-state', publicState(g));
   });
-  socket.on('save-and-exit', (cb = () => {}) => {
+  limitEvent(socket, 'save-and-exit', { windowMs: 60_000, max: 10 }, (cb = () => {}) => {
+    if (typeof cb !== 'function') cb = () => {};
     const g = games.get(socket.data.gameId); if (!g || g.socketId !== socket.id) return cb({ error: '没有正在进行的游戏。' });
     try { stopClock(g); g.paused = true; persistGame(g); games.delete(g.gameId); socket.leave(g.gameId); socket.data.gameId = null; cb({ saveId: g.saveId }); }
     catch (e) { cb({ error: '保存失败：' + e.message }); }
   });
-  socket.on('exit-without-save', () => {
+  limitEvent(socket, 'exit-without-save', { windowMs: 60_000, max: 30 }, () => {
     const g = games.get(socket.data.gameId); if (!g || g.socketId !== socket.id) return;
     games.delete(g.gameId); socket.leave(g.gameId); socket.data.gameId = null;
   });
-  socket.on('resume-save', ({ playerId, saveId, name } = {}, cb = () => {}) => {
+  limitEvent(socket, 'resume-save', { windowMs: 60_000, max: 10 }, ({ saveId, name } = {}, cb = () => {}) => {
+    if (typeof cb !== 'function') cb = () => {};
     try {
-      const pid = validPlayerId(playerId); if (!pid) return cb({ error: '玩家 ID 无效。' });
       const db = readDB(), index = db.saves.findIndex(s => s.saveId === saveId && s.playerId === pid);
       if (index < 0) return cb({ error: '没有找到存档，可能已过期或已被清理。' });
       const snapshot = db.saves.splice(index, 1)[0]; saveDB(db);
@@ -274,7 +370,7 @@ io.on('connection', socket => {
       cb({ gameId, state: publicState(g) });
     } catch (e) { cb({ error: e.message || '恢复存档失败。' }); }
   });
-  socket.on('leaderboard-request', (difficulty, cb = () => {}) => cb(leaderboard(MODES[difficulty] ? difficulty : null)));
+  limitEvent(socket, 'leaderboard-request', { windowMs: 60_000, max: 30 }, (difficulty, cb = () => {}) => { if (typeof cb === 'function') cb(leaderboard(MODES[difficulty] ? difficulty : null)); });
   socket.on('disconnect', () => {
     const g = games.get(socket.data.gameId);
     if (g && g.socketId === socket.id && g.status === 'playing') {
@@ -283,4 +379,7 @@ io.on('connection', socket => {
     }
   });
 });
+// 兜底：任何漏网的异常只记日志，不允许一条畸形数据包击杀整个进程
+process.on('uncaughtException', e => console.error('uncaughtException:', e));
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e));
 server.listen(PORT, () => console.log(`扫雷竞速已启动：http://localhost:${PORT}`));
