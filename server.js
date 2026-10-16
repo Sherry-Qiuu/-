@@ -185,12 +185,12 @@ function solverCanFinish(board, rows, cols, start) {
   }
   return opened.size === safeTotal;
 }
-function generateBoard(difficulty, maxAttempts = 12000) {
+function generateBoard(difficulty, start, maxAttempts = 12000) {
   const cfg = MODES[difficulty];
   if (!cfg) throw new Error('难度无效');
   const { rows, cols, mines } = cfg, total = rows * cols;
-  // First click is a fixed, safe opening with a safe 3x3 neighborhood.
-  const start = Math.floor(rows / 2) * cols + Math.floor(cols / 2);
+  if (!Number.isInteger(start) || start < 0 || start >= total) throw new Error('起点无效');
+  // 玩家首次点击的格子及其周围一圈为保护区，保证首点必然安全且零开
   const protectedCells = new Set([start, ...neighbors(start, rows, cols)]);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const positions = new Set();
@@ -220,9 +220,11 @@ function stopClock(g) {
 }
 function startClock(g) { if (!g.startedAt && !g.paused && g.status === 'playing') g.startedAt = Date.now(); }
 function publicState(g) {
+  const cells = g.board || Array.from({ length: g.rows * g.cols },
+    () => ({ revealed: false, flagged: false, count: 0, mine: false }));
   return { difficulty: g.difficulty, rows: g.rows, cols: g.cols, mines: g.mines, status: g.status,
     paused: g.paused, elapsedSeconds: elapsed(g),
-    board: g.board.map(c => ({ revealed: c.revealed, flagged: c.flagged,
+    board: cells.map(c => ({ revealed: c.revealed, flagged: c.flagged,
       count: c.revealed && !c.mine ? c.count : 0, mine: g.status === 'lost' && c.mine })) };
 }
 function reveal(g, index) {
@@ -336,15 +338,31 @@ io.on('connection', socket => {
     if (typeof cb !== 'function') cb = () => {};
     try {
       if (!MODES[difficulty]) return cb({ error: '请选择有效难度。' });
+      const cfg = MODES[difficulty];
       const gameId = id(6).toUpperCase();
-      const g = { ...generateBoard(difficulty), gameId, playerId: pid, playerName: safeName(name), difficulty,
-        socketId: socket.id, saveId: id(16), scoreSaved: false };
+      // 棋盘延迟到首次点击时围绕玩家点击的格子生成（点哪开哪），开局零等待
+      const g = { gameId, playerId: pid, playerName: safeName(name), difficulty,
+        rows: cfg.rows, cols: cfg.cols, mines: cfg.mines,
+        board: null, firstIndex: -1, firstClickPending: true,
+        status: 'playing', elapsedSeconds: 0, startedAt: null, paused: false,
+        createdAt: new Date().toISOString(), socketId: socket.id, saveId: id(16), scoreSaved: false };
       games.set(gameId, g); socket.join(gameId); socket.data.gameId = gameId;
       cb({ gameId, state: publicState(g) });
     } catch (e) { cb({ error: e.message || '创建游戏失败。' }); }
   });
   limitEvent(socket, 'reveal', { windowMs: 10_000, max: 120 }, ({ index } = {}) => {
     const g = games.get(socket.data.gameId); if (!g || g.socketId !== socket.id) return;
+    if (g.firstClickPending && !g.board) {
+      const total = g.rows * g.cols;
+      const start = Number.isInteger(index) && index >= 0 && index < total ? index : Math.floor(g.rows / 2) * g.cols + Math.floor(g.cols / 2);
+      try {
+        const b = generateBoard(g.difficulty, start);
+        g.board = b.board; g.firstIndex = b.firstIndex;
+      } catch (e) {
+        socket.emit('game-error', { error: '这个开局暂时排不出可解棋盘，请换一个格子点击。' });
+        return;
+      }
+    }
     reveal(g, index);
     if (g.status === 'won' && !g.scoreSaved) {
       g.scoreSaved = true;

@@ -8,6 +8,7 @@ function fmt(n) { n = Math.max(0, Number(n) || 0); return `${String(Math.floor(n
 // 玩家身份由服务器通过 HttpOnly 签名 Cookie 管理，浏览器端不再保存或上报 playerId
 socket.on('connect', () => { $('connection').textContent = '已连接'; loadSaves(); loadLeaderboard(); });
 socket.on('disconnect', () => { $('connection').textContent = '连接断开'; toast('连接断开。服务器会尝试自动保存当前游戏。'); });
+socket.on('game-error', r => toast((r && r.error) || '发生未知错误。'));
 socket.on('reconnect_attempt', n => { $('connection').textContent = `重连中…(第 ${n} 次)`; });
 socket.on('connect_error', e => {
   const reason = e && e.message ? e.message : '网络错误';
@@ -33,7 +34,7 @@ $('exitBtn').addEventListener('click', () => { if (!confirm('退出且不保存�
 function render(s) {
   $('mineCounter').textContent = s.mines; $('timer').textContent = fmt(s.elapsedSeconds);
   $('pauseOverlay').classList.toggle('hidden', !s.paused); $('pauseBtn').textContent = s.paused ? '继续' : '暂停'; $('pauseBtn').disabled = s.status !== 'playing';
-  $('gameMessage').textContent = s.status === 'won' ? `通关成功！用时 ${fmt(s.elapsedSeconds)}。` : s.status === 'lost' ? '踩到地雷，本局结束。' : s.paused ? '计时已暂停。' : `难度：${MODE_NAMES[s.difficulty]}。左键翻开，右键插旗。首次翻格会打开安全起点。`;
+  $('gameMessage').textContent = s.status === 'won' ? `通关成功！用时 ${fmt(s.elapsedSeconds)}。` : s.status === 'lost' ? '踩到地雷，本局结束。' : s.paused ? '计时已暂停。' : `难度：${MODE_NAMES[s.difficulty]}。左键翻开，右键插旗。首次点击的格子及其周围一圈必定安全。`;
   const board = $('board'); const cellSize = window.innerWidth < 600 ? 26 : 32; board.style.gridTemplateColumns = `repeat(${s.cols}, ${cellSize}px)`; board.replaceChildren();
   s.board.forEach((cell, index) => {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'cell' + (cell.revealed ? ' revealed' : '') + (cell.mine ? ' mine' : '') + (cell.flagged ? ' flagged' : '');
